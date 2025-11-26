@@ -1,0 +1,11 @@
+{
+  "test_mae": 0.053777534514665604,
+  "test_rmse": 0.06389757990837097,
+  "test_mse": 0.00408290047198534,
+  "tail_mae": 0.060035962611436844,
+  "tail_rmse": 0.07199673354625702,
+  "tail_mse": 0.005183530040085316,
+  "pred_eol_epoch": 347,
+  "pred_eol_reached": true,
+  "eol_threshold": 0.98
+}

@@ -1,0 +1,21 @@
+{
+  "files": [
+    "DV_device2_features_pca_scores.csv",
+    "DV_device3_features_pca_scores.csv",
+    "DV_device4_features_pca_scores.csv",
+    "DV_device5_features_pca_scores.csv"
+  ],
+  "config": {
+    "lo": 18,
+    "lp": 1,
+    "num_layers": 2,
+    "hidden_size": 128,
+    "epochs": 50,
+    "batch_size": 64,
+    "lr": 0.002,
+    "cut_ratio": 0.7
+  },
+  "pi": {
+    "alpha": 0.0
+  }
+}
