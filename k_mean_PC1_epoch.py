@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-PC1–Epoch (Progress) clustering (Modified)
+PC1–Epoch (Progress) clustering WITH SORTING
+--------------------------------------------
+Input:  ./PCA/*.csv
+Output: ./results_kmeans_pc1_epoch/k{K}/...
 
-Input  (relative): ./PCA/*.csv
-Output (per run):  ./results_kmeans_pc1_epoch/k{K}/...
-
-Changes from original:
-- Clustering features: [pc1_scaled, progress_01] instead of [pc1_scaled, pc2_scaled]
-- Plots updated to show PC1 vs Progress as the main clustering space.
+Feature: Clusters are sorted by Time/Progress.
+         Label 0 = Early life (Healthy)
+         Label K-1 = End of life (Failure)
 """
 
 import argparse
@@ -22,7 +22,6 @@ from sklearn.cluster import KMeans
 # ----------------------------- I/O & detection -----------------------------
 
 def detect_column(df: pd.DataFrame, candidates):
-    """Return first column whose name contains any candidate (case-insensitive)."""
     for cand in candidates:
         pat = re.compile(re.escape(cand), re.IGNORECASE)
         for col in df.columns:
@@ -46,27 +45,26 @@ def load_all_devices(pca_dir: Path):
 
         col_epoch = detect_column(df, ["epoch","row_index","index","time","t","step"])
         col_pc1   = detect_column(df, ["pc1","pc 1","pc1_score","pc1score","pc1_component","PC1"])
-        # We still load PC2 if present, just in case, but won't use it for clustering
-        col_pc2   = detect_column(df, ["pc2","pc 2","pc2_score","pc2score","pc2_component","PC2"])
-
-        # Check minimally for epoch and pc1
-        missing = [name for name, col in [("epoch", col_epoch), ("pc1", col_pc1)] if col is None]
-        if missing:
-            print(f"[WARN] {f.name}: missing required columns {missing}. Skipping.")
+        
+        if col_epoch is None or col_pc1 is None:
+            print(f"[WARN] {f.name}: missing epoch or pc1. Skipping.")
             continue
 
-        cols_to_keep = [col_epoch, col_pc1]
-        new_names = ["epoch", "pc1"]
-        if col_pc2:
-            cols_to_keep.append(col_pc2)
-            new_names.append("pc2")
-        
-        sub = df[cols_to_keep].copy()
-        sub.columns = new_names
+        # Keep only needed columns
+        sub = df[[col_epoch, col_pc1]].copy()
+        sub.columns = ["epoch", "pc1"]
 
-        # Drop NaNs
-        sub = sub.replace([np.inf, -np.inf], np.nan).dropna(subset=["epoch","pc1"])
-        
+        # --- OUTLIER REMOVAL (IQR) ---
+        # Optional: Remove extreme outliers to help MinMaxScaler
+        sub = sub.replace([np.inf, -np.inf], np.nan).dropna()
+        Q1 = sub['pc1'].quantile(0.25)
+        Q3 = sub['pc1'].quantile(0.75)
+        IQR = Q3 - Q1
+        lower = Q1 - 2.5 * IQR
+        upper = Q3 + 2.5 * IQR
+        sub = sub[(sub['pc1'] >= lower) & (sub['pc1'] <= upper)]
+        # -----------------------------
+
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             try:
@@ -87,7 +85,7 @@ def load_all_devices(pca_dir: Path):
 # ----------------------------- progress & scaling -----------------------------
 
 def per_device_progress(d: pd.DataFrame) -> pd.DataFrame:
-    """progress_01 = (epoch - e_min)/(e_max - e_min)."""
+    """Calculates progress (0->1) based on epoch."""
     dd = d.copy()
     e_min = float(dd["epoch"].min())
     e_max = float(dd["epoch"].max())
@@ -100,15 +98,10 @@ def per_device_progress(d: pd.DataFrame) -> pd.DataFrame:
     return dd
 
 def fit_minmax_per_device(datasets):
-    """Per-device MinMax for PC1 (and PC2 if exists)."""
     scalers = {}
     for d in datasets:
         dev = d["device_id"].iloc[0]
-        # Scale PC1
         scalers[(dev, "pc1")] = MinMaxScaler().fit(d[["pc1"]].to_numpy())
-        # Scale PC2 if exists
-        if "pc2" in d.columns:
-            scalers[(dev, "pc2")] = MinMaxScaler().fit(d[["pc2"]].to_numpy())
     return scalers
 
 def apply_scaling_per_device(datasets, scalers):
@@ -116,217 +109,156 @@ def apply_scaling_per_device(datasets, scalers):
     for d in datasets:
         dev = d["device_id"].iloc[0]
         dd = d.copy()
-        
-        # Scale PC1
         sc_pc1 = scalers[(dev, "pc1")]
         dd["pc1_scaled"] = sc_pc1.transform(d[["pc1"]].to_numpy())[:,0]
-        
-        # Scale PC2 if exists
-        if "pc2" in d.columns:
-            sc_pc2 = scalers[(dev, "pc2")]
-            dd["pc2_scaled"] = sc_pc2.transform(d[["pc2"]].to_numpy())[:,0]
-        else:
-            dd["pc2_scaled"] = np.nan
-            
         out.append(dd)
     return out
 
-# --------------------------------- k-means --------------------------------------
+# ----------------------------- K-Means with SORTING -----------------------------
 
-def kmeans_labels(X: np.ndarray, k: int, random_state: int):
-    """Return (model, labels) or (None, None) if not enough points."""
-    # X rows with NaN (e.g. single epoch progress) should be handled or dropped before
-    # Here we assume X is clean.
+def kmeans_labels_sorted(X: np.ndarray, k: int, random_state: int):
+    """
+    Runs K-Means and then RELABELS clusters based on their Progress coordinate.
+    X column 0: PC1
+    X column 1: Progress
+    """
     if X.shape[0] < k:
-        return None, None
+        return None, None, None
+        
+    # 1. Run standard K-Means
     km = KMeans(n_clusters=k, n_init=20, random_state=random_state)
     labels = km.fit_predict(X)
-    return km, labels
+    centers = km.cluster_centers_
+    
+    # 2. Sort centers based on Column 1 (Progress)
+    # This gives us the indices of centers from lowest progress to highest
+    sorted_idx = np.argsort(centers[:, 1]) 
+    
+    # 3. Create a mapping: Old_Label -> New_Sorted_Label
+    # If sorted_idx is [2, 0, 1], it means:
+    # Old Cluster 2 becomes New Cluster 0 (Start)
+    # Old Cluster 0 becomes New Cluster 1 (Middle)
+    # Old Cluster 1 becomes New Cluster 2 (End)
+    map_dict = {old_lbl: new_lbl for new_lbl, old_lbl in enumerate(sorted_idx)}
+    
+    # 4. Apply mapping to labels
+    new_labels = np.array([map_dict[l] for l in labels])
+    
+    # 5. Reorder centers to match the new labels (for plotting)
+    sorted_centers = centers[sorted_idx]
+    
+    return km, new_labels, sorted_centers
 
-# --------------------------------- plotting -------------------------------------
+# ----------------------------- plotting -----------------------------
 
 def plot_clustering_space(df: pd.DataFrame, labels, centers, title: str, outpath: Path):
-    """
-    Scatter plot of the clustering space: PC1 (scaled) vs Progress (0-1).
-    """
-    fig, ax = plt.subplots(figsize=(6.2, 5.6), dpi=140)
+    """Plot PC1 (y) vs Progress (x) with sorted clusters."""
+    fig, ax = plt.subplots(figsize=(7, 5), dpi=140)
     
-    # X-axis: Progress (Epoch scaled), Y-axis: PC1 scaled
     x = df["progress_01"].to_numpy()
     y = df["pc1_scaled"].to_numpy()
     
     if labels is None:
-        ax.scatter(x, y, c="#8c8c8c", s=28, alpha=0.9, edgecolors="none", label="no k-means")
+        ax.scatter(x, y, c="#8c8c8c", s=20, alpha=0.5, label="no k-means")
     else:
-        labels = np.asarray(labels)
-        k = int(labels.max()) + 1 if labels.size else 0
-        cmap = plt.get_cmap("tab10")
-        for ci in range(k):
-            idx = np.where(labels == ci)[0]
-            if idx.size == 0:
-                continue
-            ax.scatter(x[idx], y[idx], s=28, alpha=0.9, edgecolors="none", c=[cmap(ci % 10)], label=f"cluster {ci}")
+        # Use a colormap that shows progression (e.g., viridis or plasma)
+        cmap = plt.get_cmap("viridis", int(labels.max()) + 1)
         
-        # Plot centers if provided (centers are in [progress, pc1] or [pc1, progress] space?)
-        # NOTE: We clustered on [pc1_scaled, progress_01], so centers are (pc1, progress).
-        # But we plot x=progress, y=pc1. So we must swap coordinates for plotting centers.
+        # Scatter plot colored by label
+        sc = ax.scatter(x, y, c=labels, cmap=cmap, s=20, alpha=0.8, edgecolor='none')
+        
+        # Add colorbar to show the order
+        cbar = plt.colorbar(sc, ax=ax, ticks=range(int(labels.max()) + 1))
+        cbar.set_label('Cluster ID (0=Start -> K=End)')
+
+        # Plot Centers
         if centers is not None:
-            # centers[:,0] is pc1, centers[:,1] is progress
-            ax.scatter(centers[:,1], centers[:,0], marker="X", s=110, linewidths=1.2, edgecolors="black", label="centers")
-            
-    ax.legend(loc="best", frameon=True, title="k-means (global)")
-    ax.set_xlabel("Progress (0→1)")
-    ax.set_ylabel("PC1 (min–max scaled)")
+            # centers are [pc1, progress]. We plot (progress, pc1)
+            ax.scatter(centers[:,1], centers[:,0], c='red', marker="X", s=150, edgecolors="black", label="Centers", zorder=10)
+            # Add numbers to centers
+            for i, c in enumerate(centers):
+                ax.text(c[1], c[0], str(i), fontsize=12, fontweight='bold', color='white', ha='center', va='center')
+
+    ax.set_xlabel("Progress (0 -> 1)")
+    ax.set_ylabel("PC1 (Scaled)")
     ax.set_title(title)
     ax.grid(True, alpha=0.25)
     fig.tight_layout()
     fig.savefig(outpath, bbox_inches="tight")
     plt.close(fig)
 
-def plot_hi_inv_vs_rul(df: pd.DataFrame, title: str, outpath: Path):
-    """Scatter y=1-pc1_scaled vs progress_01 and overlay RUL_line = 1 - progress_01."""
-    if "progress_01" not in df.columns or df["progress_01"].isna().all():
-        return
-    x = df["progress_01"].to_numpy()
-    hi_inv = 1.0 - df["pc1_scaled"].to_numpy()
-    fig, ax = plt.subplots(figsize=(6.4, 4.6), dpi=140)
-    ax.scatter(x, hi_inv, s=26, alpha=0.9, edgecolors="none", label="HI_inv = 1 - pc1_scaled")
-    ax.plot([0,1], [1,0], linewidth=1.6, alpha=0.95, label="RUL_line = 1 - progress")
-    ax.set_xlabel("per-device progress (0→1)"); ax.set_ylabel("value")
-    ax.set_title(title); ax.grid(True, alpha=0.25); ax.legend(loc="best", frameon=True)
-    fig.tight_layout(); fig.savefig(outpath, bbox_inches="tight"); plt.close(fig)
-
-# --------------------------------- fs layout ------------------------------------
-
-def ensure_dirs(base: Path):
-    subpaths = [
-        "plots/per_device",
-        "plots/per_device_hi_rul",
-        "plots/combined",
-        "tables/per_device",
-        "tables/per_device_progress",
-        "tables/per_device_hi_rul",
-        "tables/combined",
-        "tables/combined_progress",
-        "tables/combined_hi_rul",
-    ]
-    for sub in subpaths:
-        (base / sub).mkdir(parents=True, exist_ok=True)
-
-# ----------------------------------- main ---------------------------------------
+# ----------------------------- main -----------------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="PC1–Epoch(Progress) k-means.")
-    ap.add_argument("--k", type=int, default=3, help="number of clusters")
-    ap.add_argument("--random_state", type=int, default=42, help="random seed for k-means")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--k", type=int, default=4, help="Number of clusters (Stages)")
+    ap.add_argument("--random_state", type=int, default=42)
     args = ap.parse_args()
 
+    # Setup paths
     root = Path(__file__).resolve().parent            
     pca_dir = root / "PCA"                            
-    # Changed output directory to distinguish from PC1-PC2 clustering
     out_dir = root / "results_kmeans_pc1_epoch" / f"k{args.k}"  
-    ensure_dirs(out_dir)
+    
+    # Create directories
+    for sub in ["plots/per_device", "plots/combined", "tables/per_device", "tables/combined"]:
+        (out_dir / sub).mkdir(parents=True, exist_ok=True)
 
-    # 1) Load
+    # 1. Load Data
+    print("Loading datasets...")
     datasets_raw = load_all_devices(pca_dir)
 
-    # 2) progress per device
+    # 2. Add Progress
     datasets_prog = [per_device_progress(d) for d in datasets_raw]
 
-    # 3) per-device scaling
-    scalers  = fit_minmax_per_device(datasets_prog)
+    # 3. Scale PC1
+    scalers = fit_minmax_per_device(datasets_prog)
     datasets = apply_scaling_per_device(datasets_prog, scalers)
 
-    # 4) combined k-means (global labels) on [PC1, Progress]
+    # 4. Combine for K-Means
     combo = pd.concat(datasets, ignore_index=True)
-    
-    # ---- KEY CHANGE HERE: Clustering on PC1 and Progress ----
-    # Drop rows with NaN (e.g. if single epoch file resulted in NaN progress)
     valid_mask = combo["pc1_scaled"].notna() & combo["progress_01"].notna()
-    combo_valid = combo.loc[valid_mask].copy()
     
-    Xc = combo_valid[["pc1_scaled", "progress_01"]].to_numpy()
+    # Data for clustering: [PC1, Progress]
+    Xc = combo.loc[valid_mask, ["pc1_scaled", "progress_01"]].to_numpy()
     
-    kmc, labels_c = kmeans_labels(Xc, args.k, args.random_state)
+    print(f"Running K-Means (k={args.k}) on {len(Xc)} points...")
     
-    # Initialize global cluster column with NaN
+    # --- RUN SORTED K-MEANS ---
+    km_model, labels_sorted, centers_sorted = kmeans_labels_sorted(Xc, args.k, args.random_state)
+    
+    # Assign labels back
     combo["cluster_global"] = np.nan
-    centers_c = None
+    if km_model is not None:
+        combo.loc[valid_mask, "cluster_global"] = labels_sorted.astype(int)
+
+    # 5. Save Combined Results
+    plot_clustering_space(combo, combo["cluster_global"], centers_sorted, 
+                          f"Combined Data | K={args.k} (Sorted by Progress)", 
+                          out_dir / "plots/combined/combined_clusters.png")
     
-    if kmc is not None:
-        combo.loc[valid_mask, "cluster_global"] = labels_c.astype(int)
-        centers_c = kmc.cluster_centers_  # shape (k, 2) -> [pc1, progress]
+    combo.to_csv(out_dir / "tables/combined/combined.csv", index=False)
 
-    # 5) push labels back per device (keep concat order)
-    per_device = []
-    start = 0
-    for d in datasets:
-        n = len(d)
-        dd = d.copy()
-        dd["cluster_global"] = combo["cluster_global"].iloc[start:start+n].to_numpy()
-        per_device.append(dd)
-        start += n
-
-    # 6) per-device outputs
-    rows_hi_rul = []
-    for d in per_device:
-        dev = d["device_id"].iloc[0]
-
-        # PLOT: PC1 vs Progress (Clustering Space)
-        plot_clustering_space(
-            d,
-            d["cluster_global"].to_numpy() if not d["cluster_global"].isna().all() else None,
-            centers_c,
-            title=f"{dev} | PC1 vs Progress (Clusters) | k={args.k}",
-            outpath=out_dir / f"plots/per_device/{dev}_clusters.png"
-        )
+    # 6. Save Per-Device Results
+    # Need to split combo back to devices to keep order
+    print("Saving per-device results...")
+    
+    # Group by device_id from combo dataframe directly
+    for dev_id, df_dev in combo.groupby("device_id"):
+        # Sort by epoch just to be safe
+        df_dev = df_dev.sort_values("epoch")
         
-        # Plot: HI_inv vs RUL_line
-        plot_hi_inv_vs_rul(
-            d, title=f"{dev} HI_inv vs RUL_line | k={args.k}",
-            outpath=out_dir / f"plots/per_device_hi_rul/{dev}_hi_inv_vs_rul.png"
-        )
+        # Save CSV
+        df_dev.to_csv(out_dir / f"tables/per_device/{dev_id}.csv", index=False)
+        
+        # Plot
+        # We use the global centers for reference
+        labels_dev = df_dev["cluster_global"].to_numpy()
+        plot_clustering_space(df_dev, labels_dev, centers_sorted,
+                              f"{dev_id} | K={args.k} (Sorted)",
+                              out_dir / f"plots/per_device/{dev_id}.png")
 
-        # Tables
-        cols_export = ["device_id","epoch","progress_01","pc1_scaled","cluster_global"]
-        if "pc2_scaled" in d.columns:
-            cols_export.append("pc2_scaled")
-            
-        base = d[cols_export].copy()
-        base["k"] = args.k
-        base.to_csv(out_dir / f"tables/per_device/{dev}.csv", index=False)
-
-        prog = d[["device_id","epoch","progress_01"]].copy()
-        prog.to_csv(out_dir / f"tables/per_device_progress/{dev}_progress.csv", index=False)
-
-        hi_tbl = d[["device_id","epoch","progress_01","pc1_scaled","cluster_global"]].copy()
-        hi_tbl["HI_inv"]   = 1.0 - d["pc1_scaled"]
-        hi_tbl["RUL_line"] = 1.0 - d["progress_01"]
-        hi_tbl.to_csv(out_dir / f"tables/per_device_hi_rul/{dev}_hi_rul.csv", index=False)
-        rows_hi_rul.append(hi_tbl)
-
-    # 7) combined outputs
-    # Plot combined PC1 vs Progress
-    plot_clustering_space(
-        combo,
-        combo["cluster_global"].to_numpy() if not combo["cluster_global"].isna().all() else None,
-        centers_c,
-        title=f"COMBINED | PC1 vs Progress (Clusters) | k={args.k}",
-        outpath=out_dir / f"plots/combined/combined_clusters.png"
-    )
-
-    tblc = combo.copy()
-    tblc["k"] = args.k
-    tblc.to_csv(out_dir / f"tables/combined/combined.csv", index=False)
-
-    prog_c = combo[["device_id","epoch","progress_01"]].copy()
-    prog_c.to_csv(out_dir / f"tables/combined_progress/combined_progress.csv", index=False)
-
-    if rows_hi_rul:
-        combo_hi = pd.concat(rows_hi_rul, ignore_index=True)
-        combo_hi.to_csv(out_dir / f"tables/combined_hi_rul/combined_hi_rul.csv", index=False)
-
-    print(f"\nDone. Outputs → {out_dir}  (parent: {out_dir.parent})")
+    print(f"\nDone! Results saved in: {out_dir}")
 
 if __name__ == "__main__":
     main()
