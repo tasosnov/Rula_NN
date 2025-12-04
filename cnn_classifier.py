@@ -93,6 +93,114 @@ class FCN(nn.Module):
         return self.fc(x)
 
 # -------------------------------------------------------------------
+# ------------------------- 3. Data Processing Helpers -------------------------
+
+def create_sliding_windows(data, targets, window_size):
+    """
+    Creates sliding windows from 1D arrays.
+    """
+    X, y = [], []
+    # Loop until len(data) - window_size
+    for i in range(len(data) - window_size + 1):
+        window = data[i : i + window_size]
+        X.append(window.reshape(-1, 1)) # Add feature dimension (Window, 1)
+        
+        if targets is not None:
+            # Assign label of the last timestamp in the window
+            y.append(targets[i + window_size - 1])
+            
+    return np.array(X), np.array(y) if targets is not None else None
+
+
+def load_labeled_data(data_dir, labels_csv_path, feature_col, selected_devices=None):
+    """
+    Loads data from CSVs and merges with labels from K-Means.
+    Automatically handles 'Wide' format (e.g., columns like 'ΔVCE_epoch_2').
+    """
+    print(f"[INFO] Loading labels from: {labels_csv_path}")
+    labels_df = pd.read_csv(labels_csv_path)
+    
+    # Filter specific devices if requested (partial matching)
+    if selected_devices:
+        print(f"[INFO] Filtering for devices containing: {selected_devices}")
+        mask = labels_df['device_id'].apply(lambda x: any(dev in x for dev in selected_devices))
+        labels_df = labels_df[mask]
+    
+    all_features = []
+    all_labels = []
+
+    # Get unique device IDs from the labels file
+    unique_devices = labels_df['device_id'].unique()
+    
+    for dev_id in unique_devices:
+        # Clean filename: remove suffix to match Raw Data filename (e.g. DV_device2.csv)
+        clean_name = dev_id.replace("_features_pca_scores", "")
+        filename = f"{clean_name}.csv"
+        file_path = os.path.join(data_dir, filename)
+        
+        if not os.path.exists(file_path):
+            print(f"[WARN] File not found: {file_path}. Skipping...")
+            continue
+            
+        print(f"[INFO] Processing {clean_name}...")
+        
+        try:
+            # Read CSV
+            df = pd.read_csv(file_path)
+            
+            # --- AUTO-FIX: Handle Wide Format ---
+            # Check if columns contain 'epoch' strings like 'ΔVCE_epoch_2'
+            epoch_cols = [c for c in df.columns if 'epoch' in c]
+            
+            if len(epoch_cols) > 0 and 'cluster_global' not in df.columns:
+                print(f"   -> Detected wide format ({len(epoch_cols)} epoch columns). Reshaping...")
+                
+                # Add a row index to preserve time order during melt
+                df['row_id'] = range(len(df))
+                
+                # Melt: Turn columns into rows
+                # var_name='epoch_str' will hold 'ΔVCE_epoch_2'
+                # value_name='value' will hold the sensor reading
+                df_long = df.melt(id_vars=['row_id'], value_vars=epoch_cols, 
+                                  var_name='epoch_str', value_name='value')
+                
+                # Extract epoch number using regex (find digits in the string)
+                df_long['epoch'] = df_long['epoch_str'].str.extract(r'(\d+)').astype(float)
+                
+                # Drop invalid rows and sort by epoch then time (row_id)
+                df_long = df_long.dropna(subset=['epoch'])
+                df_long['epoch'] = df_long['epoch'].astype(int)
+                df_long = df_long.sort_values(by=['epoch', 'row_id'])
+                
+                # Update main dataframe to be the transformed one
+                df = df_long
+                
+                # Override feature_col to 'value' because that's what we created
+                input_feature = 'value'
+            else:
+                input_feature = feature_col
+            # ------------------------------------
+
+            # Merge with labels
+            # Labels DF has: device_id, epoch, cluster_global
+            device_labels = labels_df[labels_df['device_id'] == dev_id]
+            
+            # Merge on epoch
+            merged = pd.merge(df, device_labels[['epoch', 'cluster_global']], on='epoch', how='inner')
+            
+            if len(merged) == 0:
+                print(f"[WARN] No matching epochs found for {clean_name} after merge.")
+                continue
+            
+            # Append data
+            all_features.extend(merged[input_feature].values)
+            all_labels.extend(merged['cluster_global'].values)
+            
+        except Exception as e:
+            print(f"[ERROR] Failed processing {filename}: {e}")
+            continue
+
+    return np.array(all_features), np.array(all_labels)
 # ------------------------- 4. Training & Main Loop -------------------------
 
 def train(args):
