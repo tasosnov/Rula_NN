@@ -190,8 +190,21 @@ def train(args):
     print("[INFO] Splitting data...")
     X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
     
-    train_loader = DataLoader(TimeSeriesClsDataset(X_train, y_train), batch_size=args.batch_size, shuffle=True)
-    val_loader   = DataLoader(TimeSeriesClsDataset(X_val, y_val),   batch_size=args.batch_size, shuffle=False)
+    # Ορίζουμε πόσους "εργάτες" (πυρήνες CPU) θα χρησιμοποιήσουμε για φόρτωση
+    # Στα Windows, ξεκινήστε με 2 ή 4. Αν βγάλει σφάλμα, γυρίστε το στο 0.
+    workers = 4 
+
+    train_loader = DataLoader(TimeSeriesClsDataset(X_train, y_train), 
+                          batch_size=args.batch_size, 
+                          shuffle=True, 
+                          num_workers=workers, 
+                          pin_memory=True) # Το pin_memory βοηθάει στη γρήγορη μεταφορά στη GPU
+
+    val_loader = DataLoader(TimeSeriesClsDataset(X_val, y_val), 
+                        batch_size=args.batch_size, 
+                        shuffle=False, 
+                        num_workers=workers, 
+                        pin_memory=True)
     
     # 4. Μοντέλο
     num_classes = len(np.unique(labels))
