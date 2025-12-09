@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import pandas as pd
 import numpy as np
 import os
-import argparse
+import re
 
 # --- Model Definition (Must match training architecture) ---
 class FCN(nn.Module):
@@ -34,7 +34,6 @@ def load_model(model_path, device):
         raise FileNotFoundError(f"Model file not found: {model_path}")
     
     state_dict = torch.load(model_path, map_location=device)
-    # Infer number of classes from the final fully connected layer weights
     num_classes = state_dict['fc.weight'].shape[0]
     
     model = FCN(num_classes=num_classes)
@@ -43,87 +42,110 @@ def load_model(model_path, device):
     model.eval()
     return model, num_classes
 
-def get_window_data(csv_path, target_index, window_size, column=None):
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Data file not found: {csv_path}")
-
-    df = pd.read_csv(csv_path)
+def preprocess_wide_format(df):
+    """
+    Detects columns like 'ΔVCE_epoch_X', melts them into a single time series,
+    and sorts by epoch. Matches the training logic.
+    """
+    # Identify epoch columns (containing 'epoch')
+    epoch_cols = [c for c in df.columns if 'epoch' in c]
     
-    # Determine feature column
-    if column:
-        if column not in df.columns:
-            raise ValueError(f"Column '{column}' not found in CSV.")
-        data = df[column].values
-    else:
-        # Default to the first numeric column found
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        if len(numeric_cols) == 0:
-            raise ValueError("No numeric columns found in CSV.")
-        data = df[numeric_cols[0]].values
+    if not epoch_cols:
+        raise ValueError("No columns containing 'epoch' found in CSV. Cannot process wide format.")
 
-    # Handle window slicing with padding if necessary
-    start_idx = target_index - window_size + 1
+    print(f"[INFO] Detected {len(epoch_cols)} epoch columns (e.g., {epoch_cols[0]}...). Processing...")
+
+    # Create a row identifier to keep multiple features separate if they exist
+    df['row_id'] = range(len(df))
     
-    if start_idx < 0:
-        # Pad with the first value if we are at the beginning of the series
-        window = data[0 : target_index + 1]
-        pad_width = window_size - len(window)
-        window = np.pad(window, (pad_width, 0), mode='edge')
-    else:
-        window = data[start_idx : target_index + 1]
+    # Melt: Transform columns to rows
+    df_long = df.melt(id_vars=['row_id'], value_vars=epoch_cols, 
+                      var_name='epoch_str', value_name='value')
+    
+    # Extract epoch number from string (e.g., 'ΔVCE_epoch_2' -> 2)
+    df_long['epoch'] = df_long['epoch_str'].str.extract(r'(\d+)').astype(float).astype(int)
+    
+    # Sort by epoch to create the correct time sequence
+    df_long = df_long.sort_values(by=['epoch', 'row_id'])
+    
+    # Return the single 'value' column as the time series
+    return df_long['value'].values, df_long['epoch'].values
 
-    return window
-
-def run_inference(model_path, csv_path, target_index, window_size, column=None):
+def run_inference(model_path, csv_path, target_epoch, window_size):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Device: {device}")
 
-    # Load Model
+    # 1. Load Data & Preprocess
+    try:
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"CSV not found: {csv_path}")
+            
+        df = pd.read_csv(csv_path)
+        
+        # Transform wide format (columns) to long format (time series)
+        time_series, epochs = preprocess_wide_format(df)
+        
+        print(f"[INFO] Time series constructed. Total length: {len(time_series)}")
+        
+    except Exception as e:
+        print(f"[ERROR] Data processing failed: {e}")
+        return
+
+    # 2. Extract Window for Target Epoch
+    # Find the index in the array where epoch == target_epoch
+    # Note: If multiple rows exist per epoch, this takes the last one effectively due to padding logic below
+    indices = np.where(epochs == target_epoch)[0]
+    
+    if len(indices) == 0:
+        print(f"[ERROR] Epoch {target_epoch} not found in data. Max epoch is {epochs.max()}.")
+        return
+    
+    # We take the end index of the target epoch
+    end_idx = indices[-1]
+    start_idx = end_idx - window_size + 1
+
+    if start_idx < 0:
+        print(f"[WARN] Not enough history for window size {window_size}. Padding with first value.")
+        window = time_series[0 : end_idx + 1]
+        pad_width = window_size - len(window)
+        window = np.pad(window, (pad_width, 0), mode='edge')
+    else:
+        window = time_series[start_idx : end_idx + 1]
+
+    # 3. Load Model & Predict
     try:
         model, num_classes = load_model(model_path, device)
-        print(f"[INFO] Model loaded. Detected classes: {num_classes}")
+        
+        input_tensor = torch.tensor(window, dtype=torch.float32).unsqueeze(0).unsqueeze(2).to(device)
+        
+        with torch.no_grad():
+            logits = model(input_tensor)
+            probs = F.softmax(logits, dim=1)
+            
+        logits = logits.cpu().numpy().flatten()
+        probs = probs.cpu().numpy().flatten()
+        prediction = np.argmax(probs)
+
+        print("\n" + "="*50)
+        print(f"Inference for Epoch: {target_epoch}")
+        print("="*50)
+        print(f"{'Cluster':<10} | {'Logit Score':<15} | {'Probability':<15}")
+        print("-" * 50)
+        for i in range(num_classes):
+            mark = "<-- PREDICTED" if i == prediction else ""
+            print(f"Cluster {i:<2} | {logits[i]:<15.4f} | {probs[i]:<15.4f} {mark}")
+        print("="*50 + "\n")
+        
     except Exception as e:
-        print(f"[ERROR] Failed to load model: {e}")
-        return
-
-    # Load Data Window
-    try:
-        window_data = get_window_data(csv_path, target_index, window_size, column)
-        print(f"[INFO] Loaded window ending at index {target_index} (Size: {window_data.shape})")
-    except Exception as e:
-        print(f"[ERROR] Failed to load data: {e}")
-        return
-
-    # Prepare Tensor (Batch=1, Length=window_size, Channels=1)
-    input_tensor = torch.tensor(window_data, dtype=torch.float32).unsqueeze(0).unsqueeze(2).to(device)
-
-    # Inference
-    with torch.no_grad():
-        logits = model(input_tensor)
-        probs = F.softmax(logits, dim=1)
-
-    # Output Results
-    logits = logits.cpu().numpy().flatten()
-    probs = probs.cpu().numpy().flatten()
-    prediction = np.argmax(probs)
-
-    print("\nInference Results")
-    print("-" * 50)
-    print(f"{'Cluster':<10} | {'Logit Score':<15} | {'Probability':<15}")
-    print("-" * 50)
-    for i in range(num_classes):
-        mark = "(*)" if i == prediction else ""
-        print(f"{i:<10} | {logits[i]:<15.4f} | {probs[i]:<15.4f} {mark}")
-    print("-" * 50)
-    print(f"Predicted Cluster: {prediction}")
+        print(f"[ERROR] Inference failed: {e}")
 
 if __name__ == "__main__":
     # --- Configuration ---
     MODEL_PATH = "cnn_model.pt"
-    DATA_PATH = "Raw_Data/DV_device5.csv" # Example path, change as needed
-    TARGET_INDEX = 50              # The index (row) in the CSV to classify
-    WINDOW_SIZE = 64                      # Must match training window size
-    COLUMN_NAME = None                    # Specify column name if known, else None
+    # Change this to your actual raw data file with the columns ΔVCE_epoch_...
+    DATA_PATH = "Raw_Data/DV_device2.csv" 
+    TARGET_EPOCH = 50   # The epoch number (from the column name) you want to test
+    WINDOW_SIZE = 64    # Must match training
     # ---------------------
 
-    run_inference(MODEL_PATH, DATA_PATH, TARGET_INDEX, WINDOW_SIZE, COLUMN_NAME)
+    run_inference(MODEL_PATH, DATA_PATH, TARGET_EPOCH, WINDOW_SIZE)
