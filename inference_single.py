@@ -120,8 +120,8 @@ def run_inference(model_path, csv_path, target_index, window_size, column=None):
 if __name__ == "__main__":
     # --- Configuration ---
     MODEL_PATH = "cnn_model.pt"
-    DATA_PATH = "Raw_Data/DV_device2.csv" # Example path, change as needed
-    TARGET_INDEX = 1000                   # The index (row) in the CSV to classify
+    DATA_PATH = "Raw_Data/DV_device5.csv" # Example path, change as needed
+    TARGET_INDEX = 50              # The index (row) in the CSV to classify
     WINDOW_SIZE = 64                      # Must match training window size
     COLUMN_NAME = None                    # Specify column name if known, else None
     # ---------------------
