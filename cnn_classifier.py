@@ -61,7 +61,7 @@ class FCN(nn.Module):
         return self.fc(x)
 
 # ------------------------- 3. Data Processing Helpers -------------------------
-def create_sliding_windows(data, targets, window_size, step=10):
+def create_sliding_windows(data, targets, window_size, step=1):
     """
     Δημιουργεί παράθυρα με βήμα (step) για μείωση της μνήμης.
     """
