@@ -47,31 +47,31 @@ def preprocess_wide_format(df):
     Detects columns like 'ΔVCE_epoch_X', melts them into a single time series,
     and sorts by epoch. Matches the training logic.
     """
-    # Identify epoch columns (containing 'epoch')
     epoch_cols = [c for c in df.columns if 'epoch' in c]
     
     if not epoch_cols:
-        raise ValueError("No columns containing 'epoch' found in CSV. Cannot process wide format.")
+        raise ValueError("No columns containing 'epoch' found in CSV.")
 
-    print(f"[INFO] Detected {len(epoch_cols)} epoch columns (e.g., {epoch_cols[0]}...). Processing...")
+    print(f"[INFO] Detected {len(epoch_cols)} epoch columns. Processing...")
 
-    # Create a row identifier to keep multiple features separate if they exist
     df['row_id'] = range(len(df))
     
     # Melt: Transform columns to rows
     df_long = df.melt(id_vars=['row_id'], value_vars=epoch_cols, 
                       var_name='epoch_str', value_name='value')
     
-    # Extract epoch number from string (e.g., 'ΔVCE_epoch_2' -> 2)
+    # Extract epoch number from string
     df_long['epoch'] = df_long['epoch_str'].str.extract(r'(\d+)').astype(float).astype(int)
     
     # Sort by epoch to create the correct time sequence
     df_long = df_long.sort_values(by=['epoch', 'row_id'])
     
-    # Return the single 'value' column as the time series
     return df_long['value'].values, df_long['epoch'].values
 
-def run_inference(model_path, csv_path, target_epoch, window_size):
+def run_inference(model_path, csv_path, target_epoch_index, window_size):
+    """
+    target_epoch_index: 0-based index (0 = First Epoch, 1 = Second Epoch...)
+    """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Device: {device}")
 
@@ -81,31 +81,38 @@ def run_inference(model_path, csv_path, target_epoch, window_size):
             raise FileNotFoundError(f"CSV not found: {csv_path}")
             
         df = pd.read_csv(csv_path)
-        
-        # Transform wide format (columns) to long format (time series)
         time_series, epochs = preprocess_wide_format(df)
         
-        print(f"[INFO] Time series constructed. Total length: {len(time_series)}")
+        # --- LOGIC: Map 0-based Index to Actual Epoch Label ---
+        unique_epochs = np.sort(np.unique(epochs))
         
+        if target_epoch_index < 0 or target_epoch_index >= len(unique_epochs):
+            print(f"[ERROR] Target index {target_epoch_index} is out of range.")
+            print(f"       Available range: 0 to {len(unique_epochs) - 1}")
+            return
+
+        # Direct 0-based indexing
+        actual_epoch_label = unique_epochs[target_epoch_index]
+        print(f"[INFO] Index {target_epoch_index} corresponds to Column/Epoch: {int(actual_epoch_label)}")
+        # --------------------------------------------------
+
     except Exception as e:
         print(f"[ERROR] Data processing failed: {e}")
         return
 
-    # 2. Extract Window for Target Epoch
-    # Find the index in the array where epoch == target_epoch
-    # Note: If multiple rows exist per epoch, this takes the last one effectively due to padding logic below
-    indices = np.where(epochs == target_epoch)[0]
+    # 2. Extract Window
+    indices = np.where(epochs == actual_epoch_label)[0]
     
     if len(indices) == 0:
-        print(f"[ERROR] Epoch {target_epoch} not found in data. Max epoch is {epochs.max()}.")
+        print(f"[ERROR] No data found for epoch {actual_epoch_label}.")
         return
     
-    # We take the end index of the target epoch
+    # Take the window ending at the last point of this epoch
     end_idx = indices[-1]
     start_idx = end_idx - window_size + 1
 
     if start_idx < 0:
-        print(f"[WARN] Not enough history for window size {window_size}. Padding with first value.")
+        print(f"[WARN] Not enough history. Padding with first value.")
         window = time_series[0 : end_idx + 1]
         pad_width = window_size - len(window)
         window = np.pad(window, (pad_width, 0), mode='edge')
@@ -127,7 +134,7 @@ def run_inference(model_path, csv_path, target_epoch, window_size):
         prediction = np.argmax(probs)
 
         print("\n" + "="*50)
-        print(f"Inference for Epoch: {target_epoch}")
+        print(f"Inference for Epoch Index: {target_epoch_index} (Label: {int(actual_epoch_label)})")
         print("="*50)
         print(f"{'Cluster':<10} | {'Logit Score':<15} | {'Probability':<15}")
         print("-" * 50)
@@ -142,10 +149,12 @@ def run_inference(model_path, csv_path, target_epoch, window_size):
 if __name__ == "__main__":
     # --- Configuration ---
     MODEL_PATH = "cnn_model.pt"
-    # Change this to your actual raw data file with the columns ΔVCE_epoch_...
-    DATA_PATH = "Raw_Data/DV_device2.csv" 
-    TARGET_EPOCH = 50   # The epoch number (from the column name) you want to test
-    WINDOW_SIZE = 64    # Must match training
+    DATA_PATH = "Raw_Data/DV_device5.csv" 
+    
+    # 0 = First Epoch, 1 = Second Epoch, etc.
+    TARGET_EPOCH =   49 
+    
+    WINDOW_SIZE = 64
     # ---------------------
 
     run_inference(MODEL_PATH, DATA_PATH, TARGET_EPOCH, WINDOW_SIZE)
