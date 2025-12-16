@@ -152,7 +152,7 @@ if __name__ == "__main__":
     DATA_PATH = "Raw_Data/DV_device5.csv" 
     
     # 0 = First Epoch, 1 = Second Epoch, etc.
-    TARGET_EPOCH =   49 
+    TARGET_EPOCH =   70 
     
     WINDOW_SIZE = 64
     # ---------------------
