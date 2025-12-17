@@ -440,6 +440,21 @@ def main():
     with open(os.path.join(args.out_dir,"run_meta.json"),"w",encoding="utf-8") as f:
         json.dump(meta,f,indent=2,ensure_ascii=False)
 
+    # ==========================================
+    # ΠΡΟΣΘΗΚΗ: Αποθήκευση Μοντέλου (.pt) στο out_dir
+    # ==========================================
+    
+    model_filename = "nn_softpi_model.pt"
+    # ΔΙΟΡΘΩΣΗ: Χρήση του args.out_dir αντί για out_dir
+    model_save_path = os.path.join(args.out_dir, model_filename)
+
+    try:
+        torch.save(model.state_dict(), model_save_path)
+        print(f"\n[INFO] Το μοντέλο αποθηκεύτηκε επιτυχώς στο: {model_save_path}")
+    except NameError:
+        print("\n[ERROR] Δεν βρέθηκε μεταβλητή 'model' ή 'args.out_dir'.")
+    except Exception as e:
+        print(f"\n[ERROR] Σφάλμα κατά την αποθήκευση του μοντέλου: {e}")
 
 if __name__=="__main__":
     main()
